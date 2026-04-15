@@ -1,0 +1,466 @@
+import jax
+import jax.numpy as jnp
+from jax import grad, jit, vmap
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.optimize import minimize
+
+# Enable 64-bit precision for numerical stability
+jax.config.update("jax_enable_x64", True)
+
+class VariationalCurrentOptimizer:
+    """
+    Variational analysis of steady-state current J/p(0) using JAX automatic differentiation.
+    Optimizes the potential V(x) to extremize the current.
+    """
+    
+    def __init__(self, L=1.0, alpha=1.0, n_points=100):
+        """
+        Parameters:
+        -----------
+        L : float
+            System length
+        alpha : float
+            Model parameter
+        n_points : int
+            Number of spatial discretization points
+        """
+        self.L = L
+        self.alpha = alpha
+        self.n_points = n_points
+        self.x = jnp.linspace(0, L, n_points)
+        self.dx = L / (n_points - 1)
+        
+        # Trajectory tracking
+        self.trajectory = []
+        self.objective_history = []
+        
+    def compute_derivative(self, V):
+        """Compute spatial derivative using finite differences"""
+        return jnp.gradient(V, self.dx)
+    
+    def compute_second_derivative(self, V):
+        """Compute second spatial derivative"""
+        dV = self.compute_derivative(V)
+        return jnp.gradient(dV, self.dx)
+    
+    def compute_xi(self, V, a_idx, b_idx):
+        """
+        Compute ξ_{a,b} = exp[∫_a^b dc α∂_c V / (V^2 - (∂_c V)^2)]
+        """
+        dV = self.compute_derivative(V)
+        integrand = self.alpha * dV / (V**2 - dV**2 + 1e-10)  # Add small epsilon for stability
+        
+        # Integrate from a to b
+        integral = jnp.trapezoid(integrand[a_idx:b_idx+1], self.x[a_idx:b_idx+1])
+        return jnp.exp(integral)
+    
+    def compute_full_current(self, V):
+        """
+        Compute J/P_0 using the FULL functional form:
+        
+        J/P_0 = L(1 - ξ_{0,L}) / [TERM1 + TERM2]
+        
+        where:
+        TERM1 = ∫₀^L dx [(∂_x V - α)/V²] ξ_{0,x} ∫₀^L dx' [V/(V² - (∂_x' V)²)] ξ_{x',x}
+        
+        TERM2 = (1 - ξ_{0,L}) ∫₀^L dx [1/(V² - (∂_x V)²)] ∫₀^x dx' [(∂²_x' V - α) ξ_{x',x}]
+        """
+        dV = self.compute_derivative(V)
+        d2V = self.compute_second_derivative(V)
+        
+        # Numerator: L(1 - ξ_{0,L})
+        xi_0L = self.compute_xi(V, 0, self.n_points-1)
+        numerator = self.L * (1.0 - xi_0L)
+        
+        # TERM 1: Double integral term
+        term1_outer_integrand = jnp.zeros(self.n_points)
+        
+        for i in range(self.n_points):
+            xi_0x = self.compute_xi(V, 0, i)
+            
+            # Inner integral: ∫₀^L dx' [V/(V² - (∂_x' V)²)] ξ_{x',x}
+            inner_integrand = jnp.zeros(self.n_points)
+            for j in range(self.n_points):
+                xi_xprime_x = self.compute_xi(V, j, i)
+                denominator_inner = V[j]**2 - dV[j]**2
+                denominator_inner = jnp.where(jnp.abs(denominator_inner) < 1e-8,
+                                             jnp.sign(denominator_inner) * 1e-8,
+                                             denominator_inner)
+                inner_integrand = inner_integrand.at[j].set(
+                    V[j] / denominator_inner * xi_xprime_x
+                )
+            
+            inner_integral = jnp.trapezoid(inner_integrand, self.x)
+            
+            # Outer integrand factor
+            V_safe = jnp.where(jnp.abs(V[i]) < 1e-8, 1e-8, V[i])
+            outer_factor = (dV[i] - self.alpha) / (V_safe**2)
+            
+            term1_outer_integrand = term1_outer_integrand.at[i].set(
+                outer_factor * xi_0x * inner_integral
+            )
+        
+        term1 = jnp.trapezoid(term1_outer_integrand, self.x)
+        
+        # TERM 2: (1 - ξ_{0,L}) × ∫₀^L dx [stuff]
+        term2_outer_integrand = jnp.zeros(self.n_points)
+        
+        for i in range(self.n_points):
+            # Inner integral: ∫₀^x dx' [(∂²_x' V - α) ξ_{x',x}]
+            inner_integrand = jnp.zeros(i+1)
+            for j in range(i+1):
+                xi_xprime_x = self.compute_xi(V, j, i)
+                inner_integrand = inner_integrand.at[j].set(
+                    (d2V[j] - self.alpha) * xi_xprime_x
+                )
+            
+            if i > 0:
+                inner_integral = jnp.trapezoid(inner_integrand, self.x[:i+1])
+            else:
+                inner_integral = 0.0
+            
+            # Outer integrand factor: 1/(V² - (∂_x V)²)
+            denominator_outer = V[i]**2 - dV[i]**2
+            denominator_outer = jnp.where(jnp.abs(denominator_outer) < 1e-8,
+                                         jnp.sign(denominator_outer) * 1e-8,
+                                         denominator_outer)
+            outer_factor = 1.0 / denominator_outer
+            
+            term2_outer_integrand = term2_outer_integrand.at[i].set(
+                outer_factor * inner_integral
+            )
+        
+        term2_integral = jnp.trapezoid(term2_outer_integrand, self.x)
+        term2 = (1.0 - xi_0L) * term2_integral
+        
+        # Full denominator
+        denominator = term1 + term2
+        
+        # Add small regularization
+        denominator = jnp.where(jnp.abs(denominator) < 1e-10,
+                               jnp.sign(denominator) * 1e-10,
+                               denominator)
+        
+        # Final current
+        J_over_P0 = numerator / denominator
+        
+        return J_over_P0
+    
+    def compute_current_over_p0(self, V):
+
+        """
+        Compute J/p(0) from the variational formula:
+        
+        J/p(0) = [1 - exp(∫_0^L dx α∂_x V/(V^2-(∂_x V)^2))] / 
+                 [∫_0^L dx (∂_x V - α)/V^2 * exp(∫_0^x dx' α∂_{x'} V/(V^2-(∂_{x'} V)^2))]
+        """
+        dV = self.compute_derivative(V)
+        
+        # Numerator: 1 - ξ_{0,L}
+        xi_0L = self.compute_xi(V, 0, self.n_points-1)
+        numerator = 1.0 - xi_0L
+        
+        # Denominator: ∫_0^L dx [(∂_x V - α)/V^2] * ξ_{0,x}
+        denominator_integrand = jnp.zeros(self.n_points)
+        for i in range(self.n_points):
+            xi_0x = self.compute_xi(V, 0, i)
+            denominator_integrand = denominator_integrand.at[i].set(
+                (dV[i] - self.alpha) / (V[i]**2 + 1e-10) * xi_0x
+            )
+        
+        denominator = jnp.trapezoid(denominator_integrand, self.x)
+        
+        return numerator / (denominator + 1e-10)
+    
+    def objective(self, V_params):
+        """
+        Objective function to maximize J/p(0)
+        We'll minimize the negative to find the maximum
+        """
+        # Reconstruct V from parameters (enforce boundary conditions if needed)
+        V = V_params
+        
+        # Compute current
+        # current = self.compute_current_over_p0(V)
+        current = self.compute_full_current(V)
+        # Return negative for minimization
+        return -current
+    
+    def callback_function(self, V_current):
+        """Callback to store optimization trajectory"""
+        self.trajectory.append(np.array(V_current).copy())
+        obj_val = float(self.objective(jnp.array(V_current)))
+        self.objective_history.append(-obj_val)  # Store actual J/p(0) value
+    
+    def optimize_potential(self, V_init=None, method='L-BFGS-B', track_trajectory=True):
+        """
+        Optimize the potential V(x) to extremize J/p(0)
+        
+        Parameters:
+        -----------
+        V_init : array-like, optional
+            Initial guess for V(x). If None, uses V(x) = 1 (constant - zero asymmetry)
+        method : str
+            Optimization method for scipy.optimize.minimize
+        track_trajectory : bool
+            Whether to track the optimization trajectory
+        
+        Returns:
+        --------
+        result : OptimizeResult
+            Optimization result containing optimized V(x)
+        """
+        if V_init is None:
+            # Start from constant potential (zero asymmetry)
+            V_init = jnp.ones(self.n_points)
+        
+        # Reset trajectory
+        self.trajectory = []
+        self.objective_history = []
+        
+        # Convert to numpy for scipy
+        V_init_np = np.array(V_init)
+        
+        # Store initial point
+        if track_trajectory:
+            self.callback_function(V_init_np)
+        
+        # Gradient function using JAX
+        grad_fn = jit(grad(self.objective))
+        
+        def objective_np(V):
+            return float(self.objective(jnp.array(V)))
+        
+        def grad_np(V):
+            return np.array(grad_fn(jnp.array(V)))
+        
+        # Callback wrapper
+        def callback_wrapper(V):
+            if track_trajectory:
+                self.callback_function(V)
+        
+        # Optimize
+        result = minimize(
+            objective_np,
+            V_init_np,
+            method=method,
+            jac=grad_np,
+            callback=callback_wrapper if track_trajectory else None,
+            options={'maxiter': 1000, 'disp': True}
+        )
+        
+        return result 
+    
+    def plot_optimization_trajectory(self, V_init, V_opt, result):
+        """
+        Plot the optimization trajectory showing how V(x) evolves
+        """
+        n_snapshots = min(len(self.trajectory), 10)  # Show up to 10 snapshots
+        indices = np.linspace(0, len(self.trajectory)-1, n_snapshots, dtype=int)
+        
+        fig = plt.figure(figsize=(18, 12))
+        gs = fig.add_gridspec(3, 2, hspace=0.3, wspace=0.3)
+        
+        # Plot 1: Evolution of V(x) over iterations
+        ax1 = fig.add_subplot(gs[0, :])
+        cmap = plt.cm.viridis
+        for idx, i in enumerate(indices):
+            color = cmap(idx / (len(indices) - 1))
+            label = f'Iter {i}' if i > 0 else 'Initial (a=0)'
+            alpha = 0.3 + 0.7 * (idx / (len(indices) - 1))
+            linewidth = 1 + 2 * (idx / (len(indices) - 1))
+            ax1.plot(self.x, self.trajectory[i], color=color, label=label, 
+                    alpha=alpha, linewidth=linewidth)
+        
+        ax1.set_xlabel('Position x', fontsize=14)
+        ax1.set_ylabel('V(x)', fontsize=14)
+        ax1.set_title('Optimization Trajectory: Evolution of Potential V(x)', 
+                     fontsize=16, fontweight='bold')
+        ax1.legend(fontsize=10, ncol=2, loc='best')
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Objective function (J/p(0)) over iterations
+        ax2 = fig.add_subplot(gs[1, 0])
+        iterations = np.arange(len(self.objective_history))
+        ax2.plot(iterations, self.objective_history, 'o-', linewidth=2, markersize=4, 
+                color='darkblue')
+        ax2.set_xlabel('Iteration', fontsize=12)
+        ax2.set_ylabel('J/p(0)', fontsize=12)
+        ax2.set_title('Objective Function vs Iteration', fontsize=14, fontweight='bold')
+        ax2.grid(True, alpha=0.3)
+        
+        # Add annotation for improvement
+        if len(self.objective_history) > 1:
+            initial_val = self.objective_history[0]
+            final_val = self.objective_history[-1]
+            improvement = ((final_val - initial_val) / abs(initial_val)) * 100
+            ax2.text(0.5, 0.95, f'Improvement: {improvement:.1f}%', 
+                    transform=ax2.transAxes, fontsize=11,
+                    bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8),
+                    verticalalignment='top', horizontalalignment='center')
+        
+        # Plot 3: Log scale objective (if it helps)
+        ax3 = fig.add_subplot(gs[1, 1])
+        # Take absolute value and add small constant for negative values
+        obj_abs = np.abs(np.array(self.objective_history)) + 1e-10
+        ax3.semilogy(iterations, obj_abs, 's-', linewidth=2, markersize=4, 
+                    color='darkgreen')
+        ax3.set_xlabel('Iteration', fontsize=12)
+        ax3.set_ylabel('|J/p(0)|', fontsize=12)
+        ax3.set_title('Objective Function (Log Scale)', fontsize=14, fontweight='bold')
+        ax3.grid(True, alpha=0.3, which='both')
+        
+        # Plot 4: Initial vs Final comparison
+        ax4 = fig.add_subplot(gs[2, 0])
+        ax4.plot(self.x, V_init, 'b--', label='Initial V(x) (a=0)', linewidth=3, alpha=0.7)
+        ax4.plot(self.x, V_opt, 'r-', label='Optimized V(x)', linewidth=3)
+        ax4.set_xlabel('Position x', fontsize=12)
+        ax4.set_ylabel('V(x)', fontsize=12)
+        ax4.set_title('Initial vs Optimized Potential', fontsize=14, fontweight='bold')
+        ax4.legend(fontsize=11)
+        ax4.grid(True, alpha=0.3)
+        
+        # Plot 5: Derivative evolution
+        ax5 = fig.add_subplot(gs[2, 1])
+        dV_init = self.compute_derivative(jnp.array(V_init))
+        dV_opt = self.compute_derivative(jnp.array(V_opt))
+        ax5.plot(self.x, dV_init, 'b--', label='Initial ∂V/∂x', linewidth=3, alpha=0.7)
+        ax5.plot(self.x, dV_opt, 'r-', label='Optimized ∂V/∂x', linewidth=3)
+        ax5.axhline(y=0, color='k', linestyle=':', alpha=0.3)
+        ax5.set_xlabel('Position x', fontsize=12)
+        ax5.set_ylabel('∂V/∂x', fontsize=12)
+        ax5.set_title('Spatial Derivative Evolution', fontsize=14, fontweight='bold')
+        ax5.legend(fontsize=11)
+        ax5.grid(True, alpha=0.3)
+        
+        # Main title
+        fig.suptitle('Variational Optimization Trajectory: From Zero Asymmetry to Optimum', 
+                    fontsize=18, fontweight='bold', y=0.98)
+        
+        plt.savefig('/Users/Adele/Downloads/Systematic Ratchet Current', dpi=300, bbox_inches='tight')
+        print("\nTrajectory plot saved: optimization_trajectory.png")
+        return fig
+    
+    def plot_results(self, V_init, V_opt, result):
+        """
+        Visualize the optimization results
+        """
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        
+        # Plot 1: Initial vs Optimized Potential
+        ax1 = axes[0, 0]
+        ax1.plot(self.x, V_init, 'b--', label='Initial V(x) (a=0)', linewidth=2)
+        ax1.plot(self.x, V_opt, 'r-', label='Optimized V(x)', linewidth=2)
+        ax1.set_xlabel('x', fontsize=12)
+        ax1.set_ylabel('V(x)', fontsize=12)
+        ax1.set_title('Potential V(x)', fontsize=14, fontweight='bold')
+        ax1.legend(fontsize=10)
+        ax1.grid(True, alpha=0.3)
+        
+        # Plot 2: Derivatives
+        ax2 = axes[0, 1]
+        dV_init = self.compute_derivative(jnp.array(V_init))
+        dV_opt = self.compute_derivative(jnp.array(V_opt))
+        ax2.plot(self.x, dV_init, 'b--', label='Initial ∂V/∂x', linewidth=2)
+        ax2.plot(self.x, dV_opt, 'r-', label='Optimized ∂V/∂x', linewidth=2)
+        ax2.set_xlabel('x', fontsize=12)
+        ax2.set_ylabel('∂V/∂x', fontsize=12)
+        ax2.set_title('Spatial Derivative', fontsize=14, fontweight='bold')
+        ax2.legend(fontsize=10)
+        ax2.grid(True, alpha=0.3)
+        
+        # Plot 3: Current values
+        ax3 = axes[1, 0]
+        J_init = -self.objective(jnp.array(V_init))
+        J_opt = -self.objective(jnp.array(V_opt))
+        ax3.bar(['Initial (a=0)', 'Optimized'], [J_init, J_opt], 
+                color=['blue', 'red'], alpha=0.7, edgecolor='black', linewidth=2)
+        ax3.set_ylabel('J/p(0)', fontsize=12)
+        ax3.set_title('Current Comparison', fontsize=14, fontweight='bold')
+        ax3.grid(True, axis='y', alpha=0.3)
+        
+        # Add values on bars
+        for i, (label, val) in enumerate([('Initial', J_init), ('Optimized', J_opt)]):
+            ax3.text(i, val, f'{val:.4f}', ha='center', va='bottom', fontsize=10, fontweight='bold')
+        
+        # Plot 4: Optimization statistics
+        ax4 = axes[1, 1]
+        if hasattr(result, 'nit'):
+            ax4.text(0.5, 0.7, f'Optimization Results:', ha='center', fontsize=14, fontweight='bold')
+            ax4.text(0.5, 0.5, f'Iterations: {result.nit}', ha='center', fontsize=12)
+            ax4.text(0.5, 0.4, f'Success: {result.success}', ha='center', fontsize=12)
+            ax4.text(0.5, 0.3, f'Final J/p(0): {J_opt:.6f}', ha='center', fontsize=12)
+            if J_init != 0:
+                ax4.text(0.5, 0.2, f'Improvement: {((J_opt/J_init - 1)*100):.2f}%', 
+                        ha='center', fontsize=12, color='green' if J_opt > J_init else 'red')
+            ax4.text(0.5, 0.1, f'Message: {result.message}', ha='center', fontsize=10, 
+                    wrap=True, style='italic')
+        ax4.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig('/Users/Adele/Downloads/Systematic Ratchet Current', dpi=300, bbox_inches='tight')
+        print("\nPlot saved: optimization_results.png")
+        return fig
+
+
+def main():
+    """Run the variational analysis optimization starting from zero asymmetry"""
+    
+    print("="*70)
+    print("Variational Analysis of Steady-State Current using JAX")
+    print("Starting from ZERO ASYMMETRY (constant potential)")
+    print("="*70)
+    
+    # Initialize optimizer
+    L = 3.0
+    alpha = 1.0
+    n_points = 20
+    
+    print(f"\nParameters:")
+    print(f"  System length L = {L}")
+    print(f"  Alpha parameter = {alpha}")
+    print(f"  Grid points = {n_points}")
+    
+    optimizer = VariationalCurrentOptimizer(L=L, alpha=alpha, n_points=n_points)
+    
+    # Initial potential: CONSTANT (zero asymmetry)
+    V_init = jnp.ones(n_points)  # V(x) = 1 everywhere
+    
+    print(f"\nInitial potential: V(x) = 1 (constant - zero asymmetry)")
+    print(f"Initial J/p(0) = {-optimizer.objective(V_init):.6f}")
+    
+    # Optimize
+    print("\n" + "="*70)
+    print("Starting optimization from zero asymmetry...")
+    print("="*70)
+    
+    result = optimizer.optimize_potential(V_init=V_init, method='L-BFGS-B', 
+                                         track_trajectory=True)
+    
+    V_opt = result.x
+    
+    print("\n" + "="*70)
+    print("Optimization Complete!")
+    print("="*70)
+    print(f"Optimized J/p(0) = {-result.fun:.6f}")
+    print(f"Number of iterations: {result.nit}")
+    print(f"Success: {result.success}")
+    print(f"Message: {result.message}")
+    print(f"Trajectory points captured: {len(optimizer.trajectory)}")
+    
+    # Plot results
+    print("\nGenerating plots...")
+    optimizer.plot_results(V_init, V_opt, result)
+    
+    # Plot optimization trajectory
+    print("\nGenerating optimization trajectory plot...")
+    optimizer.plot_optimization_trajectory(V_init, V_opt, result)
+    
+    plt.show()
+    
+    return optimizer, V_init, V_opt, result
+
+
+if __name__ == "__main__":
+    optimizer, V_init, V_opt, result = main()
